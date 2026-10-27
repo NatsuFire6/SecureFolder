@@ -19,6 +19,7 @@ namespace
 {
 constexpr wchar_t kWindowClass[] = L"SecureFolderWindow";
 constexpr UINT kOpenSelectedMessage = WM_APP + 1;
+constexpr UINT kCreateVaultMessage = WM_APP + 2;
 constexpr int kTimerId = 1;
 constexpr int kOpenButton = 1001;
 constexpr int kCreateButton = 1002;
@@ -30,6 +31,7 @@ constexpr int kSleepCheck = 1007;
 constexpr int kShutdownCheck = 1008;
 constexpr int kForceCheck = 1009;
 constexpr int kSaveButton = 1010;
+constexpr int kSelectButton = 1011;
 constexpr wchar_t kVeraCryptVersion[] = L"1.26.29";
 constexpr wchar_t kVeraCryptInstallerUrl[] =
     L"https://launchpad.net/veracrypt/trunk/1.26.29/+download/VeraCrypt_Setup_x64_1.26.29.msi";
@@ -46,7 +48,12 @@ struct Settings
 
 HWND g_window = nullptr;
 HWND g_status = nullptr;
+HWND g_pathCaption = nullptr;
 HWND g_pathLabel = nullptr;
+HWND g_selectButton = nullptr;
+HWND g_settingsCaption = nullptr;
+HWND g_timeoutCaption = nullptr;
+HWND g_settingsNote = nullptr;
 HWND g_openButton = nullptr;
 HWND g_createButton = nullptr;
 HWND g_settingsButton = nullptr;
@@ -59,6 +66,7 @@ HWND g_forceCheck = nullptr;
 HWND g_saveButton = nullptr;
 
 std::wstring g_currentPath;
+std::wstring g_createVaultDirectory;
 std::wstring g_veraCryptPath;
 Settings g_settings;
 bool g_mounted = false;
@@ -66,12 +74,14 @@ bool g_mountPending = false;
 bool g_settingsAuthentication = false;
 bool g_keepOpenAfterAuthentication = false;
 bool g_settingsUnlocked = false;
+bool g_reauthenticationInProgress = false;
 wchar_t g_driveLetter = L'\0';
 ULONGLONG g_mountedAt = 0;
 ULONGLONG g_mountStarted = 0;
 HANDLE g_mountProcess = nullptr;
 
 void SetStatus(const std::wstring& text);
+void UpdateControls();
 
 std::wstring Quote(const std::wstring& value)
 {
@@ -611,7 +621,10 @@ std::wstring GetWindowTitle(HWND window)
     return title;
 }
 
-bool SaveAndCloseMountedFolderFiles(wchar_t letter)
+bool SaveAndCloseMountedFolderFiles(
+    wchar_t letter,
+    bool forceCloseAfterSaveFailure = false,
+    bool confirmWindows = true)
 {
     wininfo::WindowSaveManager windows;
     std::vector<HWND> matchingWindows;
@@ -667,39 +680,42 @@ bool SaveAndCloseMountedFolderFiles(wchar_t letter)
     if (matchingWindows.empty())
         return true;
 
-    std::wstring prompt =
-        L"SecureFolder a repéré des fenêtres visibles dont le titre correspond au nom d'un fichier "
-        L"du coffre :\n\n";
-    constexpr size_t kMaxTitlesToShow = 12;
-    for (size_t index = 0; index < matchingWindows.size() && index < kMaxTitlesToShow; ++index)
-        prompt += L"• " + GetWindowTitle(matchingWindows[index]) + L"\n";
-    if (matchingWindows.size() > kMaxTitlesToShow)
-        prompt += L"... et " + std::to_wstring(matchingWindows.size() - kMaxTitlesToShow) + L" autre(s)\n";
-    prompt +=
-        L"\nWindowsInfo va envoyer Ctrl+S puis demander la fermeture de ces fenêtres. "
-        L"La correspondance se fait par nom de fichier dans le titre, pas par chemin complet; "
-        L"la sauvegarde ne peut pas être vérifiée. Les applications peuvent afficher leur propre "
-        L"boîte de dialogue. Si une fenêtre ne se ferme pas, le coffre ne sera pas démonté.\n\n"
-        L"Continuer ?";
-    if (MessageBoxW(g_window, prompt.c_str(), L"Enregistrer et fermer les fichiers",
-                    MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON2) != IDYES)
+    if (confirmWindows)
     {
-        SetStatus(L"Verrouillage annulé.");
-        return false;
+        std::wstring prompt =
+            L"SecureFolder a repéré des fenêtres visibles dont le titre correspond au nom d'un fichier "
+            L"du coffre :\n\n";
+        constexpr size_t kMaxTitlesToShow = 12;
+        for (size_t index = 0; index < matchingWindows.size() && index < kMaxTitlesToShow; ++index)
+            prompt += L"• " + GetWindowTitle(matchingWindows[index]) + L"\n";
+        if (matchingWindows.size() > kMaxTitlesToShow)
+            prompt += L"... et " + std::to_wstring(matchingWindows.size() - kMaxTitlesToShow) + L" autre(s)\n";
+        prompt +=
+            L"\nWindowsInfo va envoyer Ctrl+S puis demander la fermeture de ces fenêtres. "
+            L"La correspondance se fait par nom de fichier dans le titre, pas par chemin complet; "
+            L"la sauvegarde ne peut pas être vérifiée. Les applications peuvent afficher leur propre "
+            L"boîte de dialogue. Si une fenêtre ne se ferme pas, le coffre ne sera pas démonté.\n\n"
+            L"Continuer ?";
+        if (MessageBoxW(g_window, prompt.c_str(), L"Enregistrer et fermer les fichiers",
+                        MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON2) != IDYES)
+        {
+            SetStatus(L"Verrouillage annulé.");
+            return false;
+        }
     }
 
     SetStatus(L"Envoi de Ctrl+S aux fenêtres repérées...");
     for (const HWND window : matchingWindows)
     {
-        if (!windows.SaveWindow(window))
-        {
-            SetStatus(L"Impossible d'envoyer Ctrl+S à une fenêtre du coffre.");
-            MessageBoxW(g_window,
-                        L"Impossible d'envoyer Ctrl+S à toutes les fenêtres repérées. "
-                        L"Le coffre reste déverrouillé.",
-                        L"Enregistrement impossible", MB_ICONWARNING | MB_OK);
-            return false;
-        }
+        if (IsWindow(window))
+            windows.SaveWindow(window);
+    }
+
+    if (forceCloseAfterSaveFailure)
+    {
+        SetStatus(L"Attente de 10 secondes pour laisser les applications enregistrer...");
+        UpdateWindow(g_status);
+        Sleep(10000);
     }
 
     SetStatus(L"Fermeture des fenêtres repérées...");
@@ -724,9 +740,39 @@ bool SaveAndCloseMountedFolderFiles(wchar_t letter)
             allClosed = allClosed && !IsWindow(window);
         if (allClosed)
             return true;
-        if (GetTickCount64() - closeStarted >= 15000)
+        if (GetTickCount64() - closeStarted >= (forceCloseAfterSaveFailure ? 500 : 15000))
             break;
         Sleep(100);
+    }
+
+    if (forceCloseAfterSaveFailure)
+    {
+        std::unordered_set<DWORD> processIds;
+        for (const HWND window : matchingWindows)
+        {
+            if (!IsWindow(window))
+                continue;
+            DWORD processId = 0;
+            GetWindowThreadProcessId(window, &processId);
+            if (processId != 0 && processId != GetCurrentProcessId())
+                processIds.insert(processId);
+        }
+
+        for (const DWORD processId : processIds)
+        {
+            HANDLE process = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, processId);
+            if (!process)
+                continue;
+            TerminateProcess(process, ERROR_CANCELLED);
+            WaitForSingleObject(process, 3000);
+            CloseHandle(process);
+        }
+
+        bool allClosed = true;
+        for (const HWND window : matchingWindows)
+            allClosed = allClosed && !IsWindow(window);
+        if (allClosed)
+            return true;
     }
 
     SetStatus(L"Certaines fenêtres du coffre sont toujours ouvertes.");
@@ -858,30 +904,31 @@ bool AuthenticateSettings()
 
 bool ReauthenticateToKeepOpen()
 {
-    if (!g_mounted || g_currentPath.empty())
+    if (!g_mounted || g_currentPath.empty() || g_reauthenticationInProgress)
         return false;
+
+    struct ReauthenticationGuard
+    {
+        explicit ReauthenticationGuard(bool& active) : active_(active)
+        {
+            active_ = true;
+        }
+        ~ReauthenticationGuard()
+        {
+            active_ = false;
+        }
+        bool& active_;
+    } guard(g_reauthenticationInProgress);
 
     const int answer = MessageBoxW(
         g_window,
-        L"Le délai de déverrouillage est écoulé. Enregistrez vos fichiers et fermez les documents ouverts.\n\n"
+        L"Le délai de déverrouillage est écoulé. SecureFolder va tenter d'enregistrer et de fermer les fenêtres "
+        L"des fichiers du coffre. Après 10 secondes, les applications toujours ouvertes pourront être terminées.\n\n"
         L"Choisissez OK pour verrouiller temporairement le coffre et saisir à nouveau le mot de passe. "
         L"Un mot de passe correct le remontera. Annuler verrouille le coffre sans le remonter.",
         L"Réauthentification requise", MB_ICONWARNING | MB_OKCANCEL);
-    if (answer != IDOK)
-    {
-        if (!Dismount(g_settings.forceUnmount))
-        {
-            g_mountedAt = GetTickCount64();
-            MessageBoxW(g_window,
-                        L"Le coffre reste déverrouillé car des fichiers ouverts bloquent le démontage. "
-                        L"Enregistrez et fermez ces fichiers, puis verrouillez-le.",
-                        L"Verrouillage impossible", MB_ICONWARNING | MB_OK);
-        }
-        return false;
-    }
-
     const std::wstring path = g_currentPath;
-    if (!SaveAndCloseMountedFolderFiles(g_driveLetter))
+    if (!SaveAndCloseMountedFolderFiles(g_driveLetter, true, false))
     {
         g_mountedAt = GetTickCount64();
         return false;
@@ -897,39 +944,77 @@ bool ReauthenticateToKeepOpen()
             return false;
         }
     }
-    return LaunchMount(path, false, true);
+    return answer == IDOK ? LaunchMount(path, false, true) : false;
 }
 
-void OpenFile()
+bool ChooseVaultPath(std::wstring& path)
 {
-    wchar_t path[MAX_PATH]{};
+    std::vector<wchar_t> selectedPath(32768);
     OPENFILENAMEW dialog{};
     dialog.lStructSize = sizeof(dialog);
     dialog.hwndOwner = g_window;
     dialog.lpstrFilter = L"Coffres SecureFolder (*.sf)\0*.sf\0Tous les fichiers (*.*)\0*.*\0\0";
-    dialog.lpstrFile = path;
-    dialog.nMaxFile = static_cast<DWORD>(std::size(path));
+    dialog.lpstrFile = selectedPath.data();
+    dialog.nMaxFile = static_cast<DWORD>(selectedPath.size());
     dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
     dialog.lpstrDefExt = L"sf";
-    if (GetOpenFileNameW(&dialog))
-    {
-        if (g_mounted && !Dismount(false))
-        {
-            MessageBoxW(g_window, L"Verrouillez d'abord le coffre actuellement ouvert.",
-                        L"Impossible d'ouvrir un autre coffre", MB_ICONWARNING | MB_OK);
-            return;
-        }
-        g_currentPath = path;
-        SetWindowTextW(g_pathLabel, g_currentPath.c_str());
-        SetSettingsControls(false);
-        LaunchMount(g_currentPath, false);
-    }
+    if (!GetOpenFileNameW(&dialog))
+        return false;
+    path = selectedPath.data();
+    return true;
 }
 
-void CreateVault()
+void ChangeVaultSelection()
+{
+    std::wstring path;
+    if (!ChooseVaultPath(path))
+        return;
+    if (g_mounted && !Dismount(false))
+    {
+        MessageBoxW(g_window, L"Le coffre actuel est toujours ouvert. La sélection n'a pas été changée.",
+                    L"Impossible de changer de coffre", MB_ICONWARNING | MB_OK);
+        return;
+    }
+    g_currentPath = path;
+    SetWindowTextW(g_pathLabel, g_currentPath.c_str());
+    SetSettingsControls(false);
+    SetStatus(L"Nouveau coffre sélectionné.");
+    UpdateControls();
+}
+
+void OpenFile()
+{
+    std::wstring path = g_currentPath;
+    if (path.empty() && !ChooseVaultPath(path))
+        return;
+
+    if (g_mounted && !Dismount(false))
+    {
+        MessageBoxW(g_window, L"Verrouillez d'abord le coffre actuellement ouvert.",
+                    L"Impossible d'ouvrir un autre coffre", MB_ICONWARNING | MB_OK);
+        return;
+    }
+    g_currentPath = path;
+    SetWindowTextW(g_pathLabel, g_currentPath.c_str());
+    SetSettingsControls(false);
+    LaunchMount(g_currentPath, false);
+}
+
+void CreateVault(const std::wstring& initialDirectory = {})
 {
     if (!EnsureVeraCrypt())
         return;
+    if (!initialDirectory.empty())
+    {
+        const DWORD attributes = GetFileAttributesW(initialDirectory.c_str());
+        if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0)
+        {
+            MessageBoxW(g_window, L"Le dossier choisi n'existe plus ou n'est pas accessible.",
+                        L"Dossier invalide", MB_ICONERROR | MB_OK);
+            return;
+        }
+    }
+
     const std::wstring formatPath = FindVeraCryptFormat();
     if (formatPath.empty())
     {
@@ -938,17 +1023,22 @@ void CreateVault()
                     L"Assistant de création indisponible", MB_ICONERROR | MB_OK);
         return;
     }
-    const int answer = MessageBoxW(
-        g_window,
+    std::wstring prompt =
         L"L'assistant officiel VeraCrypt va s'ouvrir pour créer le coffre chiffré.\n\n"
         L"1. Choisissez « Create an encrypted file container », puis « Standard VeraCrypt volume ».\n"
-        L"2. Choisissez le chemin et donnez au fichier le nom souhaité terminé par .sf.\n"
+        L"2. Choisissez le chemin et donnez au fichier le nom souhaité terminé par .sf";
+    if (!initialDirectory.empty())
+        prompt += L" (le dossier sélectionné dans l'Explorateur est proposé comme emplacement de départ)";
+    prompt +=
+        L".\n"
         L"3. Saisissez et confirmez le mot de passe dans VeraCrypt ; SecureFolder ne le collecte pas.\n"
         L"4. Gardez les algorithmes et les autres options par défaut. Choisissez une taille d'au moins 10 Mo.\n"
         L"5. Sur l'écran de génération aléatoire, bougez la souris jusqu'à ce que l'indicateur soit rempli, "
         L"puis terminez le formatage.\n\n"
         L"VeraCrypt exige ces étapes interactives pour utiliser son générateur et protéger le mot de passe. "
-        L"L'extension .sf doit être saisie dans le chemin de l'assistant VeraCrypt.",
+        L"L'extension .sf doit être saisie dans le chemin de l'assistant VeraCrypt.";
+    const int answer = MessageBoxW(
+        g_window, prompt.c_str(),
         L"Créer un coffre .sf", MB_ICONINFORMATION | MB_OKCANCEL);
     if (answer != IDOK)
         return;
@@ -957,6 +1047,7 @@ void CreateVault()
     execute.cbSize = sizeof(execute);
     execute.fMask = SEE_MASK_NOCLOSEPROCESS;
     execute.lpFile = formatPath.c_str();
+    execute.lpDirectory = initialDirectory.empty() ? nullptr : initialDirectory.c_str();
     execute.nShow = SW_SHOWNORMAL;
     if (!ShellExecuteExW(&execute))
     {
@@ -981,32 +1072,37 @@ void RegisterAssociation()
 
     HKEY key = nullptr;
     DWORD disposition = 0;
-    const wchar_t* keys[] = {
-        L"Software\\Classes\\.sf",
-        L"Software\\Classes\\SecureFolder.Container",
-        L"Software\\Classes\\SecureFolder.Container\\DefaultIcon",
-        L"Software\\Classes\\SecureFolder.Container\\shell\\open\\command"
+    struct RegistryValue
+    {
+        const wchar_t* path;
+        std::wstring value;
+    };
+    const std::vector<RegistryValue> values = {
+        {L"Software\\Classes\\.sf", L"SecureFolder.Container"},
+        {L"Software\\Classes\\SecureFolder.Container", L""},
+        {L"Software\\Classes\\SecureFolder.Container\\DefaultIcon", Quote(executable) + L",0"},
+        {L"Software\\Classes\\SecureFolder.Container\\shell\\open\\command", Quote(executable) + L" \"%1\""},
+        {L"Software\\Classes\\Directory\\shell\\SecureFolder.CreateVault", L"Créer un coffre SecureFolder ici (.sf)"},
+        {L"Software\\Classes\\Directory\\shell\\SecureFolder.CreateVault\\command",
+         Quote(executable) + L" --create-vault \"%1\""},
+        {L"Software\\Classes\\Directory\\Background\\shell\\SecureFolder.CreateVault",
+         L"Créer un coffre SecureFolder ici (.sf)"},
+        {L"Software\\Classes\\Directory\\Background\\shell\\SecureFolder.CreateVault\\command",
+         Quote(executable) + L" --create-vault \"%V\""}
     };
     bool success = true;
-    for (const wchar_t* keyPath : keys)
+    for (const RegistryValue& registryValue : values)
     {
-        if (RegCreateKeyExW(HKEY_CURRENT_USER, keyPath, 0, nullptr, 0, KEY_SET_VALUE,
+        if (RegCreateKeyExW(HKEY_CURRENT_USER, registryValue.path, 0, nullptr, 0, KEY_SET_VALUE,
                             nullptr, &key, &disposition) != ERROR_SUCCESS)
         {
             success = false;
             break;
         }
-        std::wstring value;
-        if (wcscmp(keyPath, keys[0]) == 0)
-            value = L"SecureFolder.Container";
-        else if (wcscmp(keyPath, keys[2]) == 0)
-            value = Quote(executable) + L",0";
-        else if (wcscmp(keyPath, keys[3]) == 0)
-            value = Quote(executable) + L" \"%1\"";
-        if (!value.empty() &&
+        if (!registryValue.value.empty() &&
             RegSetValueExW(key, nullptr, 0, REG_SZ,
-                           reinterpret_cast<const BYTE*>(value.c_str()),
-                           static_cast<DWORD>((value.size() + 1) * sizeof(wchar_t))) != ERROR_SUCCESS)
+                           reinterpret_cast<const BYTE*>(registryValue.value.c_str()),
+                           static_cast<DWORD>((registryValue.value.size() + 1) * sizeof(wchar_t))) != ERROR_SUCCESS)
             success = false;
         RegCloseKey(key);
         key = nullptr;
@@ -1018,17 +1114,18 @@ void RegisterAssociation()
     {
         if (key)
             RegCloseKey(key);
-        MessageBoxW(g_window, L"Impossible d'enregistrer l'association .sf pour cet utilisateur.",
+        MessageBoxW(g_window, L"Impossible d'enregistrer l'association .sf ou le menu contextuel pour cet utilisateur.",
                     L"Erreur", MB_ICONERROR | MB_OK);
         return;
     }
 
     SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);
     MessageBoxW(g_window,
-                L"L'association .sf est enregistrée pour cet utilisateur.\n\n"
+                L"L'association .sf et les commandes de création par clic droit sont enregistrées pour cet utilisateur.\n\n"
                 L"Windows peut demander de choisir SecureFolder dans Paramètres > Applications > Applications par défaut "
-                L"avant que le double-clic ouvre ces fichiers.",
-                L"Association enregistrée", MB_ICONINFORMATION | MB_OK);
+                L"avant que le double-clic ouvre ces fichiers. Dans l'Explorateur, cliquez avec le bouton droit sur un dossier "
+                L"ou dans son arrière-plan, puis choisissez « Créer un coffre SecureFolder ici (.sf) ».",
+                L"Association et menu contextuel enregistrés", MB_ICONINFORMATION | MB_OK);
     ShellExecuteW(g_window, L"open", L"ms-settings:defaultapps", nullptr, nullptr, SW_SHOWNORMAL);
 }
 
@@ -1104,6 +1201,7 @@ void HandleMountTimer()
         }
     }
     else if (g_mounted && g_settings.timeoutMinutes > 0 &&
+             !g_reauthenticationInProgress &&
              GetTickCount64() - g_mountedAt >=
                  static_cast<ULONGLONG>(g_settings.timeoutMinutes) * 60ULL * 1000ULL)
     {
@@ -1117,8 +1215,42 @@ void UpdateControls()
     EnableWindow(g_settingsButton, hasPath && !g_mountPending);
     EnableWindow(g_lockButton, g_mounted || g_mountPending);
     EnableWindow(g_openButton, !g_mountPending && !g_mounted);
+    EnableWindow(g_selectButton, !g_mountPending);
     EnableWindow(g_createButton, !g_mountPending && !g_mounted);
     EnableWindow(g_associateButton, TRUE);
+}
+
+void LayoutControls(HWND window)
+{
+    RECT client{};
+    GetClientRect(window, &client);
+    const int width = client.right - client.left;
+    const int height = client.bottom - client.top;
+    constexpr int margin = 16;
+    constexpr int gap = 18;
+    const int columnWidth = (width - 2 * margin - gap) / 2;
+    const int fullWidth = width - 2 * margin;
+    const int rightColumn = margin + columnWidth + gap;
+    const int saveY = (height - 76 > 444) ? height - 76 : 444;
+    const int noteY = (height - 36 > 484) ? height - 36 : 484;
+
+    MoveWindow(g_pathCaption, margin, 14, fullWidth, 20, TRUE);
+    MoveWindow(g_pathLabel, margin, 36, fullWidth - 138, 34, TRUE);
+    MoveWindow(g_selectButton, width - margin - 130, 36, 130, 28, TRUE);
+    MoveWindow(g_status, margin, 76, fullWidth, 28, TRUE);
+    MoveWindow(g_openButton, margin, 112, columnWidth, 32, TRUE);
+    MoveWindow(g_createButton, rightColumn, 112, columnWidth, 32, TRUE);
+    MoveWindow(g_settingsButton, margin, 154, fullWidth, 32, TRUE);
+    MoveWindow(g_lockButton, margin, 196, columnWidth, 32, TRUE);
+    MoveWindow(g_associateButton, rightColumn, 196, columnWidth, 32, TRUE);
+    MoveWindow(g_settingsCaption, margin, 246, fullWidth, 24, TRUE);
+    MoveWindow(g_timeoutCaption, margin, 276, fullWidth, 24, TRUE);
+    MoveWindow(g_timeoutEdit, margin, 304, 100, 26, TRUE);
+    MoveWindow(g_sleepCheck, margin, 338, fullWidth, 24, TRUE);
+    MoveWindow(g_shutdownCheck, margin, 366, fullWidth, 24, TRUE);
+    MoveWindow(g_forceCheck, margin, 394, fullWidth, 40, TRUE);
+    MoveWindow(g_saveButton, rightColumn, saveY, columnWidth, 32, TRUE);
+    MoveWindow(g_settingsNote, margin, noteY, fullWidth, 20, TRUE);
 }
 
 LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wParam, LPARAM lParam)
@@ -1127,10 +1259,12 @@ LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wParam, LPARA
     {
     case WM_CREATE:
         g_window = window;
-        CreateWindowW(L"STATIC", L"Coffre sélectionné :", WS_CHILD | WS_VISIBLE,
-                      16, 14, 440, 20, window, nullptr, nullptr, nullptr);
-        g_pathLabel = CreateWindowW(L"STATIC", L"(aucun)", WS_CHILD | WS_VISIBLE | SS_LEFT,
+        g_pathCaption = CreateWindowW(L"STATIC", L"Coffre sélectionné :", WS_CHILD | WS_VISIBLE,
+                                      16, 14, 440, 20, window, nullptr, nullptr, nullptr);
+        g_pathLabel = CreateWindowW(L"STATIC", L"(aucun)", WS_CHILD | WS_VISIBLE | SS_LEFT | SS_ENDELLIPSIS,
                                     16, 36, 448, 34, window, nullptr, nullptr, nullptr);
+        g_selectButton = CreateWindowW(L"BUTTON", L"Changer de coffre...", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                                       16, 36, 130, 28, window, reinterpret_cast<HMENU>(kSelectButton), nullptr, nullptr);
         g_status = CreateWindowW(L"STATIC", L"Verrouillé.", WS_CHILD | WS_VISIBLE,
                                  16, 76, 448, 28, window, nullptr, nullptr, nullptr);
         g_openButton = CreateWindowW(L"BUTTON", L"Ouvrir un coffre .sf", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
@@ -1141,32 +1275,49 @@ LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wParam, LPARA
                                          16, 154, 438, 32, window, reinterpret_cast<HMENU>(kSettingsButton), nullptr, nullptr);
         g_lockButton = CreateWindowW(L"BUTTON", L"Verrouiller maintenant", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
                                      16, 196, 210, 32, window, reinterpret_cast<HMENU>(kLockButton), nullptr, nullptr);
-        g_associateButton = CreateWindowW(L"BUTTON", L"Associer les fichiers .sf", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        g_associateButton = CreateWindowW(L"BUTTON", L"Associer .sf + clic droit", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
                                           244, 196, 210, 32, window, reinterpret_cast<HMENU>(kAssociateButton), nullptr, nullptr);
-        CreateWindowW(L"STATIC", L"Paramètres (modifiables après vérification du mot de passe) :",
-                      WS_CHILD | WS_VISIBLE, 16, 246, 440, 20, window, nullptr, nullptr, nullptr);
-        CreateWindowW(L"STATIC", L"Verrouiller après (minutes, 0 = désactivé) :", WS_CHILD | WS_VISIBLE,
-                      16, 274, 280, 22, window, nullptr, nullptr, nullptr);
+        g_settingsCaption = CreateWindowW(L"STATIC", L"Paramètres du coffre (mot de passe requis)",
+                                          WS_CHILD | WS_VISIBLE | SS_LEFT, 16, 246, 440, 24, window, nullptr, nullptr, nullptr);
+        g_timeoutCaption = CreateWindowW(L"STATIC", L"Verrouiller après (minutes) ; 0 désactive le délai",
+                                        WS_CHILD | WS_VISIBLE | SS_LEFT, 16, 276, 440, 24, window, nullptr, nullptr, nullptr);
         g_timeoutEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"15",
                                         WS_CHILD | WS_VISIBLE | ES_NUMBER | ES_AUTOHSCROLL,
-                                        310, 270, 74, 26, window, reinterpret_cast<HMENU>(kTimeoutEdit), nullptr, nullptr);
+                                        16, 304, 100, 26, window, reinterpret_cast<HMENU>(kTimeoutEdit), nullptr, nullptr);
         g_sleepCheck = CreateWindowW(L"BUTTON", L"Verrouiller avant la mise en veille",
-                                     WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 16, 306, 320, 24,
+                                     WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 16, 338, 320, 24,
                                      window, reinterpret_cast<HMENU>(kSleepCheck), nullptr, nullptr);
         g_shutdownCheck = CreateWindowW(L"BUTTON", L"Verrouiller avant l'arrêt de Windows",
-                                        WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 16, 334, 340, 24,
+                                        WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,                                         16, 366, 340, 24,
                                         window, reinterpret_cast<HMENU>(kShutdownCheck), nullptr, nullptr);
         g_forceCheck = CreateWindowW(L"BUTTON", L"Forcer le démontage si des fichiers sont ouverts (risque de perte de données)",
-                                     WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 16, 362, 448, 40,
+                                     WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX | BS_MULTILINE, 16, 394, 448, 40,
                                      window, reinterpret_cast<HMENU>(kForceCheck), nullptr, nullptr);
         g_saveButton = CreateWindowW(L"BUTTON", L"Enregistrer les paramètres",
-                                     WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 244, 408, 210, 32,
+                                     WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 244, 444, 210, 32,
                                      window, reinterpret_cast<HMENU>(kSaveButton), nullptr, nullptr);
-        CreateWindowW(L"STATIC", L"Les paramètres sont enregistrés à l'intérieur du volume chiffré .sf.",
-                      WS_CHILD | WS_VISIBLE, 16, 444, 448, 20, window, nullptr, nullptr, nullptr);
+        g_settingsNote = CreateWindowW(L"STATIC", L"Les paramètres sont enregistrés à l'intérieur du volume chiffré .sf.",
+                                       WS_CHILD | WS_VISIBLE, 16, 484, 448, 20, window, nullptr, nullptr, nullptr);
+        LayoutControls(window);
         SetSettingsControls(false);
         UpdateControls();
         return 0;
+
+    case WM_SIZE:
+        LayoutControls(window);
+        return 0;
+
+    case WM_GETMINMAXINFO:
+    {
+        auto* limits = reinterpret_cast<MINMAXINFO*>(lParam);
+        RECT minimum{0, 0, 460, 520};
+        const DWORD style = static_cast<DWORD>(GetWindowLongPtrW(window, GWL_STYLE));
+        const DWORD extendedStyle = static_cast<DWORD>(GetWindowLongPtrW(window, GWL_EXSTYLE));
+        AdjustWindowRectEx(&minimum, style, FALSE, extendedStyle);
+        limits->ptMinTrackSize.x = minimum.right - minimum.left;
+        limits->ptMinTrackSize.y = minimum.bottom - minimum.top;
+        return 0;
+    }
 
     case kOpenSelectedMessage:
         if (!g_currentPath.empty())
@@ -1176,11 +1327,18 @@ LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wParam, LPARA
         }
         return 0;
 
+    case kCreateVaultMessage:
+        CreateVault(g_createVaultDirectory);
+        return 0;
+
     case WM_COMMAND:
         switch (LOWORD(wParam))
         {
         case kOpenButton:
             OpenFile();
+            break;
+        case kSelectButton:
+            ChangeVaultSelection();
             break;
         case kCreateButton:
             CreateVault();
@@ -1277,8 +1435,19 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int showCommand)
 
     int argumentCount = 0;
     wchar_t** arguments = CommandLineToArgvW(GetCommandLineW(), &argumentCount);
+    bool createVaultFromExplorer = false;
     if (arguments && argumentCount > 1)
-        g_currentPath = arguments[1];
+    {
+        if (wcscmp(arguments[1], L"--create-vault") == 0 && argumentCount > 2)
+        {
+            g_createVaultDirectory = arguments[2];
+            createVaultFromExplorer = true;
+        }
+        else
+        {
+            g_currentPath = arguments[1];
+        }
+    }
     if (arguments)
         LocalFree(arguments);
 
@@ -1292,15 +1461,17 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int showCommand)
         return 1;
 
     HWND window = CreateWindowExW(0, kWindowClass, L"SecureFolder",
-                                  WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-                                  CW_USEDEFAULT, CW_USEDEFAULT, 490, 520,
+                                  WS_OVERLAPPEDWINDOW,
+                                  CW_USEDEFAULT, CW_USEDEFAULT, 490, 560,
                                   nullptr, nullptr, instance, nullptr);
     if (!window)
         return 1;
 
     ShowWindow(window, showCommand);
     UpdateWindow(window);
-    if (!g_currentPath.empty())
+    if (createVaultFromExplorer)
+        PostMessageW(window, kCreateVaultMessage, 0, 0);
+    else if (!g_currentPath.empty())
         PostMessageW(window, kOpenSelectedMessage, 0, 0);
 
     MSG message{};
