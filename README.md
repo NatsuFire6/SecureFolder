@@ -9,6 +9,8 @@ is not a native Windows directory while locked.
 - Windows
 - VeraCrypt installed from its official distribution (SecureFolder offers to
   download and install the pinned 64-bit VeraCrypt 1.26.29 MSI when needed)
+- Internet access on the first CMake configure, to fetch the pinned
+  [WindowsInfo](https://github.com/NatsuFire6/WindowsInfo) dependency
 - CMake and a C++20 compiler
 
 Build with:
@@ -43,19 +45,25 @@ handles password entry, volume creation, encryption, mounting, and dismounting.
 Lock preferences are stored in the hidden `.securefolder-settings.ini` file
 inside the mounted encrypted volume, never alongside the `.sf` container.
 
-The timeout is measured from when the volume is mounted. At timeout,
-SecureFolder warns you to save and close documents, dismounts the volume, and
-asks VeraCrypt to mount it again. A correct password keeps the volume open;
-canceling or entering a wrong password leaves it locked. If open files prevent
-normal dismount, SecureFolder warns and refuses to claim the volume is locked.
-If forced dismount is enabled, a separate confirmation warns that unsaved
-changes can be lost.
+The timeout is measured from when the volume is mounted. At timeout, or when
+you request password verification in **Paramètres**, SecureFolder uses
+WindowsInfo to find visible application windows whose titles match files in
+the mounted volume, offers to send Ctrl+S and request those windows to close,
+then dismounts the volume and asks VeraCrypt to mount it again. A correct
+password keeps the volume open; canceling or entering a wrong password leaves
+it locked. If windows do not close or open files prevent normal dismount,
+SecureFolder warns and refuses to claim the volume is locked. If forced
+dismount is enabled, a separate confirmation warns that unsaved changes can be
+lost.
 
-Windows does not let SecureFolder force another application to save or discard
-its documents, block window switching globally, or guarantee that an app has no
-unsaved in-memory changes. Close/save files before reauthentication. When the
-container is locked, VeraCrypt's dismounted volume rejects filesystem access;
-applications may still retain their own unsaved in-memory document buffers.
+WindowsInfo can only match visible windows by the file name shown in their
+title; it cannot confirm the full path or verify that an external application
+actually saved the document after Ctrl+S. Applications may show their own
+confirmation dialogs, and SecureFolder aborts locking if the matching windows
+do not close. Files without extensions and windows that do not show the file
+name may not be detected. When the container is locked, VeraCrypt's dismounted
+volume rejects filesystem access; applications may still retain their own
+unsaved in-memory document buffers.
 
 The encrypted container protects its contents while stored on disk. While
 unlocked, Windows and applications can access plaintext; operating-system

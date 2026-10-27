@@ -7,9 +7,12 @@
 #include <shellapi.h>
 #include <shlobj.h>
 #include <winhttp.h>
+#include "window_save_manager.h"
 
 #include <array>
+#include <filesystem>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace
@@ -594,6 +597,146 @@ bool WaitForUnmount(wchar_t letter, DWORD timeoutMilliseconds)
     return !IsDriveMounted(letter);
 }
 
+std::wstring GetWindowTitle(HWND window)
+{
+    const int length = GetWindowTextLengthW(window);
+    if (length <= 0)
+        return L"(titre indisponible)";
+
+    std::wstring title(static_cast<size_t>(length) + 1, L'\0');
+    const int copied = GetWindowTextW(window, title.data(), length + 1);
+    if (copied <= 0)
+        return L"(titre indisponible)";
+    title.resize(static_cast<size_t>(copied));
+    return title;
+}
+
+bool SaveAndCloseMountedFolderFiles(wchar_t letter)
+{
+    wininfo::WindowSaveManager windows;
+    std::vector<HWND> matchingWindows;
+    std::unordered_set<HWND> uniqueWindows;
+    const std::filesystem::path root(std::wstring(1, letter) + L":\\");
+    std::error_code error;
+    std::filesystem::recursive_directory_iterator entry(root, error);
+    if (error)
+    {
+        SetStatus(L"Impossible de parcourir les fichiers du coffre.");
+        MessageBoxW(g_window, L"Impossible de parcourir le coffre. Vérifiez qu'il est accessible, puis réessayez.",
+                    L"Préparation du verrouillage impossible", MB_ICONERROR | MB_OK);
+        return false;
+    }
+
+    const std::filesystem::recursive_directory_iterator end;
+    while (entry != end)
+    {
+        const std::filesystem::path path = entry->path();
+        const DWORD attributes = GetFileAttributesW(path.c_str());
+        if (attributes == INVALID_FILE_ATTRIBUTES)
+        {
+            SetStatus(L"Impossible d'identifier un fichier du coffre.");
+            MessageBoxW(g_window, L"Un fichier du coffre a changé pendant l'analyse. Réessayez.",
+                        L"Préparation du verrouillage impossible", MB_ICONERROR | MB_OK);
+            return false;
+        }
+
+        if ((attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
+        {
+            if ((attributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
+                entry.disable_recursion_pending();
+        }
+        else if ((attributes & FILE_ATTRIBUTE_DIRECTORY) == 0)
+        {
+            for (const HWND window : windows.FindWindowsForFile(path))
+            {
+                if (uniqueWindows.insert(window).second)
+                    matchingWindows.push_back(window);
+            }
+        }
+
+        entry.increment(error);
+        if (error)
+        {
+            SetStatus(L"Impossible de terminer l'analyse des fichiers du coffre.");
+            MessageBoxW(g_window, L"Impossible de terminer l'analyse du coffre. Vérifiez qu'il est accessible, puis réessayez.",
+                        L"Préparation du verrouillage impossible", MB_ICONERROR | MB_OK);
+            return false;
+        }
+    }
+
+    if (matchingWindows.empty())
+        return true;
+
+    std::wstring prompt =
+        L"SecureFolder a repéré des fenêtres visibles dont le titre correspond au nom d'un fichier "
+        L"du coffre :\n\n";
+    constexpr size_t kMaxTitlesToShow = 12;
+    for (size_t index = 0; index < matchingWindows.size() && index < kMaxTitlesToShow; ++index)
+        prompt += L"• " + GetWindowTitle(matchingWindows[index]) + L"\n";
+    if (matchingWindows.size() > kMaxTitlesToShow)
+        prompt += L"... et " + std::to_wstring(matchingWindows.size() - kMaxTitlesToShow) + L" autre(s)\n";
+    prompt +=
+        L"\nWindowsInfo va envoyer Ctrl+S puis demander la fermeture de ces fenêtres. "
+        L"La correspondance se fait par nom de fichier dans le titre, pas par chemin complet; "
+        L"la sauvegarde ne peut pas être vérifiée. Les applications peuvent afficher leur propre "
+        L"boîte de dialogue. Si une fenêtre ne se ferme pas, le coffre ne sera pas démonté.\n\n"
+        L"Continuer ?";
+    if (MessageBoxW(g_window, prompt.c_str(), L"Enregistrer et fermer les fichiers",
+                    MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON2) != IDYES)
+    {
+        SetStatus(L"Verrouillage annulé.");
+        return false;
+    }
+
+    SetStatus(L"Envoi de Ctrl+S aux fenêtres repérées...");
+    for (const HWND window : matchingWindows)
+    {
+        if (!windows.SaveWindow(window))
+        {
+            SetStatus(L"Impossible d'envoyer Ctrl+S à une fenêtre du coffre.");
+            MessageBoxW(g_window,
+                        L"Impossible d'envoyer Ctrl+S à toutes les fenêtres repérées. "
+                        L"Le coffre reste déverrouillé.",
+                        L"Enregistrement impossible", MB_ICONWARNING | MB_OK);
+            return false;
+        }
+    }
+
+    SetStatus(L"Fermeture des fenêtres repérées...");
+    for (const HWND window : matchingWindows)
+    {
+        if (IsWindow(window) && !windows.CloseWindow(window, true))
+        {
+            SetStatus(L"Impossible de demander la fermeture d'une fenêtre du coffre.");
+            MessageBoxW(g_window,
+                        L"Impossible de demander la fermeture de toutes les fenêtres repérées. "
+                        L"Le coffre reste déverrouillé.",
+                        L"Fermeture impossible", MB_ICONWARNING | MB_OK);
+            return false;
+        }
+    }
+
+    const ULONGLONG closeStarted = GetTickCount64();
+    for (;;)
+    {
+        bool allClosed = true;
+        for (const HWND window : matchingWindows)
+            allClosed = allClosed && !IsWindow(window);
+        if (allClosed)
+            return true;
+        if (GetTickCount64() - closeStarted >= 15000)
+            break;
+        Sleep(100);
+    }
+
+    SetStatus(L"Certaines fenêtres du coffre sont toujours ouvertes.");
+    MessageBoxW(g_window,
+                L"Certaines fenêtres ne se sont pas fermées. Répondez aux éventuelles boîtes de dialogue "
+                L"des applications, puis réessayez. Le coffre reste déverrouillé.",
+                L"Fermeture incomplète", MB_ICONWARNING | MB_OK);
+    return false;
+}
+
 bool Dismount(bool permitForce)
 {
     if (!g_mounted && !g_mountPending)
@@ -693,9 +836,14 @@ bool AuthenticateSettings()
         const int answer = MessageBoxW(
             g_window,
             L"Pour vérifier à nouveau le mot de passe, le coffre doit être démonté puis remonté. "
-            L"Enregistrez vos fichiers et fermez les documents ouverts avant de continuer.",
+            L"SecureFolder va repérer les fenêtres liées aux fichiers du coffre et tenter de les enregistrer "
+            L"et de les fermer avant de continuer.",
             L"Vérifier le mot de passe", MB_ICONWARNING | MB_OKCANCEL);
-        if (answer != IDOK || !Dismount(false))
+        if (answer != IDOK)
+            return false;
+        if (!SaveAndCloseMountedFolderFiles(g_driveLetter))
+            return false;
+        if (!Dismount(false))
         {
             MessageBoxW(g_window,
                         L"Le coffre n'a pas été démonté. Enregistrez et fermez les fichiers ouverts, puis réessayez.",
@@ -733,6 +881,11 @@ bool ReauthenticateToKeepOpen()
     }
 
     const std::wstring path = g_currentPath;
+    if (!SaveAndCloseMountedFolderFiles(g_driveLetter))
+    {
+        g_mountedAt = GetTickCount64();
+        return false;
+    }
     if (!Dismount(false))
     {
         if (!g_settings.forceUnmount || !Dismount(true))
